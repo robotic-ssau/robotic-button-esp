@@ -1,470 +1,587 @@
-#include <LiquidCrystal_I2C.h>  // Библиотека для LCD дисплея
-#include <ESP8266WiFi.h>        // Библиотека для работы с WiFi на ESP8266
-#include <WiFiClient.h>         // Библиотека для TCP клиента
-#include <WiFiUdp.h>            // Библиотека для UDP (нужна для NTP)
-#include <NTPClient.h>          // Библиотека для получения времени через NTP
+/*
+ * ============================================================================
+ *  Robotic Button — прошивка v2.0 (ESP8266, Arduino IDE)
+ * ============================================================================
+ */
 
-// ==================== НАСТРОЙКИ ====================
-String host = "ЗАПОЛНИТЕ СВОИМ";  // Hostname Raspberry Pi (будет разрешаться в IP через DNS)
-int port = ЗАПОЛНИТЕ СВОИМ;                 // Порт HTTP сервера на Raspberry Pi
+#include <ESP8266WiFi.h>
+#include <WiFiClient.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <LiquidCrystal_I2C.h>
 
-#define WIFI_SSID "ЗАПОЛНИТЕ СВОИМ"  // Имя WiFi сети
-#define WIFI_PASS "ЗАПОЛНИТЕ СВОИМ"      // Пароль WiFi сети
-#define BUTTON 13                 // Пин кнопки (с внутренним подтягом)
-#define LED_OPEN 12               // Пин светодиода "ОТКРЫТО"
-#define LED_CLOSE 14              // Пин светодиода "ЗАКРЫТО"
+#ifndef IRAM_ATTR
+#define IRAM_ATTR ICACHE_RAM_ATTR  // для старых версий ядра ESP8266
+#endif
 
-#define STATE_DELAY 60 * 1000  // Интервал проверки состояния (1 минута)
-#define CLOCK_DELAY 60 * 1000  // Интервал проверки времени (1 минута)
-#define CLOCK_START 22         // Час начала "ночного режима" (22:00)
-#define CLOCK_END 7            // Час окончания "ночного режима" (07:00)
+#define FW_VERSION "2.0"
 
-// ==================== ТЕКСТОВЫЕ КОНСТАНТЫ ДЛЯ LCD И SERIAL ====================
-#define INIT_1 " Initialization "
-#define INIT_2 "    program     "
+// ============================================================================
+//  НАСТРОЙКИ
+// ============================================================================
+const char*    WIFI_SSID   = "Robotic_Wifi";
+const char*    WIFI_PASS   = "robowifi";
 
-#define OPENED_1 "     Robotic    "
-#define OPENED_2 "     OPENED     "
+const char*    SERVER_HOST = "192.168.68.120";  // IP или доменное имя сервера
+const uint16_t SERVER_PORT = 8005;
+const char*    ENDPOINT_STATE  = "/state";         // GET  -> {"state": true|false}
+const char*    ENDPOINT_CHANGE = "/change_state";  // POST <- {"state": true|false}
 
-#define CLOSED_1 "     Robotic    "
-#define CLOSED_2 "     CLOSED     "
+const uint8_t  PIN_BUTTON    = 13;  // кнопка на GND, внутренняя подтяжка
+const uint8_t  PIN_LED_OPEN  = 12;  // светодиод «ОТКРЫТО»
+const uint8_t  PIN_LED_CLOSE = 14;  // светодиод «ЗАКРЫТО»
 
-#define START_SERVER_1 "   Web-server   "
-#define START_SERVER_2 "     started    "
+const uint8_t  LCD_ADDR = 0x27;
+const uint8_t  LCD_COLS = 16;
 
-#define CONNECT_SERVER_1 "     Connect    "
-#define CONNECT_SERVER_2 "    to server   "
+// Интервалы, мс
+const uint32_t POLL_INTERVAL_MS      = 60UL * 1000;  // опрос сервера в норме
+const uint32_t POLL_RETRY_MS         = 15UL * 1000;  // опрос сервера после ошибки
+const uint32_t SEND_RETRY_MS         = 10UL * 1000;  // повтор неотправленного нажатия
+const uint32_t CLOCK_INTERVAL_MS     = 60UL * 1000;  // проверка ночного режима
+const uint32_t WIFI_BOOT_TIMEOUT_MS  = 15UL * 1000;  // ожидание WiFi при старте
+const uint32_t WIFI_RETRY_MS         = 30UL * 1000;  // перезапуск подключения WiFi
+const uint32_t DNS_TIMEOUT_MS        = 3000;
+const uint32_t HTTP_CONNECT_TIMEOUT_MS  = 3000;
+const uint32_t HTTP_RESPONSE_TIMEOUT_MS = 5000;
+const uint32_t MESSAGE_MS            = 3000;  // сколько показывается сообщение
+const uint32_t BTN_STABLE_MS         = 50;    // кнопка должна быть отпущена >= N мс
+const uint32_t BTN_MIN_INTERVAL_MS   = 300;   // минимум между двумя нажатиями
 
-#define CONNECT_SERVER_FAIL_1 " Connect server "
-#define CONNECT_SERVER_FAIL_2 "     FAILED     "
+// Ночной режим
+const int      NIGHT_START_HOUR = 22;  // с 22:00
+const int      NIGHT_END_HOUR   = 7;   // до 07:00
+const long     TZ_OFFSET_SEC    = 4L * 3600;  // UTC+4 (Самара)
+const char*    NTP_SERVER       = "pool.ntp.org";
+const uint32_t NTP_UPDATE_MS    = 10UL * 60 * 1000;
 
-#define CONNECT_SERVER_SUCCESS_1 " Connect server "
-#define CONNECT_SERVER_SUCCESS_2 "     SUCCESS    "
+const size_t   MAX_RESPONSE_LEN = 1024;
+const uint32_t SERIAL_BAUD      = 9600;
 
-#define CONNECT_WIFI_1 "     Connect    "
-#define CONNECT_WIFI_2 "     to WiFi    "
-#define CONNECTED_WIFI_1 " Connected WiFi "
-#define CONNECTED_WIFI_2 " "  // Для IP адреса (будет добавляться динамически)
+// ============================================================================
+//  ТИПЫ
+// ============================================================================
+enum NetError {
+  NET_NONE = 0,
+  NET_WIFI_NO_SSID,    // сеть с таким именем не найдена
+  NET_WIFI_BAD_PASS,   // неверный пароль
+  NET_WIFI,            // нет подключения к WiFi (прочие причины)
+  NET_DNS,             // не удалось получить IP сервера
+  NET_CONNECT,         // сервер не принимает TCP-соединение
+  NET_SEND,            // запрос не отправился
+  NET_TIMEOUT,         // сервер не ответил
+  NET_HTTP,            // сервер ответил кодом != 2xx
+  NET_BAD_RESPONSE     // ответ не удалось разобрать
+};
 
-#define WIFI_FAIL_1 " WiFi connect  "
-#define WIFI_FAIL_2 "    FAILED!    "
+struct HttpResult {
+  NetError    err;
+  int         code;   // HTTP-код (если получен)
+  String      body;   // тело ответа
+  const char* path;   // к какому адресу был запрос
+};
 
-#define SEND_FAIL_1 "  Send failed   "
-#define SEND_FAIL_2 "   Check conn   "
+// ============================================================================
+//  ГЛОБАЛЬНОЕ СОСТОЯНИЕ
+// ============================================================================
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, 2);
+WiFiUDP   ntpUDP;
+NTPClient timeClient(ntpUDP, NTP_SERVER, TZ_OFFSET_SEC, NTP_UPDATE_MS);
 
-#define RESPONSE_TIMEOUT_1 "  Response      "
-#define RESPONSE_TIMEOUT_2 "    timeout     "
+bool opened      = false;  // текущее состояние (то, что показывают светодиоды)
+bool stateKnown  = false;  // состояние хотя бы раз подтверждено сервером
+bool pendingSend = false;  // локальное изменение ещё не принято сервером
+bool firstSendTry = false; // первая попытка отправки после нажатия
+bool timeSynced  = false;  // время получено по NTP хотя бы раз
 
-#define INVALID_RESPONSE_1 " Invalid server "
-#define INVALID_RESPONSE_2 "    response    "
+NetError lastError    = NET_NONE;
+int      lastHttpCode = 0;
 
-#define SERVER_ERROR_1 "  Server error  "
-#define SERVER_ERROR_2 "  State not set "
+uint32_t nextPollMs  = 0;
+uint32_t nextSendMs  = 0;
+uint32_t nextClockMs = 0;
 
-#define HTTP_ERROR_1 " HTTP Error:    "
+bool     wifiWasConnected = false;
+uint32_t wifiBeginMs      = 0;
 
-#define TIME_UPDATE_FAILED "Failed to update time"
+// Сообщение поверх экрана состояния
+bool     messageActive  = false;
+uint32_t messageStartMs = 0;
+uint32_t messageDurMs   = 0;
 
-#define BUTTON_PRESSED "Button pressed - changing state"
-#define OPEN_STATE "OPEN"
-#define CLOSE_STATE "CLOSE"
-#define LATE_NIGHT_CLOSING "Late night - closing"
-#define SENDING_REQUEST "Sending request:"
-#define RESPONSE_RECEIVED "Response received:"
-#define STATE_OPEN "State: OPEN"
-#define STATE_CLOSED "State: CLOSED"
-#define NO_STATE_IN_RESPONSE "Response doesn't contain state"
-#define HTTP_ERROR "HTTP Error: "
+// Кэш строк LCD — перерисовываем только изменившееся (без мерцания)
+String lcdCache[2];
 
-#define HTTP_TIMEOUT 5000  // Таймаут HTTP запроса (5 секунд)
+// Кнопка (меняется в прерывании)
+volatile bool     buttonFlag      = false;
+volatile uint32_t btnLastEdgeMs   = 0;
+volatile uint32_t btnLastAcceptMs = 0;
 
-// ==================== HTTP ENDPOINTS ====================
-String endpointChange = "/change_state";  // Эндпоинт для изменения состояния
-String endpointState = "/state";          // Эндпоинт для получения состояния
+// ============================================================================
+//  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// ============================================================================
 
-// ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
-volatile bool opened = false;                  // Состояние открытости/закрытости (volatile т.к. меняется в прерывании)
-volatile bool stateChanged = false;            // Флаг изменения состояния от кнопки
-bool lastOpened = false;                       // Для отслеживания изменений (не volatile)
-LiquidCrystal_I2C LCD(0x27, 16, 2);            // LCD дисплей (адрес 0x27, 16 символов, 2 строки)
-WiFiUDP ntpUDP;                                // UDP клиент для NTP
-NTPClient timeClient(ntpUDP, "pool.ntp.org");  // NTP клиент для получения времени
-WiFiClient client;                             // TCP клиент для HTTP запросов
-
-// ==================== ОБРАБОТЧИК ПРЕРЫВАНИЯ КНОПКИ ====================
-ICACHE_RAM_ATTR void handleButtonInterrupt() {
-  static unsigned long lastInterruptTime = 0;  // Время последнего прерывания (антидребезг)
-  unsigned long interruptTime = millis();
-
-  // Простой антидребезг - игнорируем прерывания, которые пришли слишком быстро
-  if (interruptTime - lastInterruptTime > 200) {
-    opened = !opened;     // Инвертируем состояние
-    stateChanged = true;  // Устанавливаем флаг для обработки в loop
-  }
-  lastInterruptTime = interruptTime;
+// Наступил ли момент t (корректно при переполнении millis()).
+bool isDue(uint32_t t) {
+  return (int32_t)(millis() - t) >= 0;
 }
 
-// ==================== НАЧАЛЬНАЯ НАСТРОЙКА ====================
+void logLine(const String& s) {
+  Serial.print('[');
+  Serial.print(millis() / 1000.0, 1);
+  Serial.print("] ");
+  Serial.println(s);
+}
+
+// Обрезает/дополняет строку пробелами до ширины дисплея.
+String fit(String s) {
+  if (s.length() > LCD_COLS) s = s.substring(0, LCD_COLS);
+  while (s.length() < LCD_COLS) s += ' ';
+  return s;
+}
+
+// Центрирует строку на дисплее.
+String center(const String& s) {
+  if (s.length() >= LCD_COLS) return fit(s);
+  String out;
+  for (unsigned i = 0; i < (LCD_COLS - s.length()) / 2; i++) out += ' ';
+  out += s;
+  return fit(out);
+}
+
+// Строка вида "Robotic   noWiFi": слева текст, справа метка.
+String leftRight(const String& left, const String& right) {
+  String s = left;
+  int spaces = (int)LCD_COLS - (int)left.length() - (int)right.length();
+  if (spaces < 1) spaces = 1;
+  for (int i = 0; i < spaces; i++) s += ' ';
+  s += right;
+  return fit(s);
+}
+
+// ============================================================================
+//  ДИСПЛЕЙ
+// ============================================================================
+void lcdLine(uint8_t row, const String& text) {
+  String t = fit(text);
+  if (t == lcdCache[row]) return;
+  lcd.setCursor(0, row);
+  lcd.print(t);
+  lcdCache[row] = t;
+}
+
+void lcdShow(const String& l1, const String& l2) {
+  lcdLine(0, l1);
+  lcdLine(1, l2);
+}
+
+// Временное сообщение; по истечении времени экран сам вернётся к состоянию.
+void showMessage(const String& l1, const String& l2, uint32_t durationMs = MESSAGE_MS) {
+  logLine("LCD: " + l1 + " | " + l2);
+  lcdShow(l1, l2);
+  messageActive  = true;
+  messageStartMs = millis();
+  messageDurMs   = durationMs;
+}
+
+// Короткая метка проблемы для экрана состояния.
+String statusTag() {
+  if (pendingSend) return "sync..";
+  switch (lastError) {
+    case NET_NONE:          return "";
+    case NET_WIFI_NO_SSID:
+    case NET_WIFI_BAD_PASS:
+    case NET_WIFI:          return "noWiFi";
+    case NET_DNS:           return "noDNS";
+    case NET_CONNECT:
+    case NET_SEND:
+    case NET_TIMEOUT:       return "noSrv";
+    case NET_HTTP:          return "E" + String(lastHttpCode);
+    case NET_BAD_RESPONSE:  return "badRsp";
+  }
+  return "err";
+}
+
+void drawStateScreen() {
+  String tag = statusTag();
+  String l1 = tag.length() ? leftRight("Robotic", tag) : center("Robotic");
+  String l2;
+  if (!stateKnown && !pendingSend) l2 = center("STATE UNKNOWN");
+  else                             l2 = center(opened ? "OPENED" : "CLOSED");
+  lcdShow(l1, l2);
+}
+
+// Вызывается в каждом проходе loop().
+void updateDisplay() {
+  if (messageActive) {
+    if (millis() - messageStartMs < messageDurMs) return;
+    messageActive = false;
+  }
+  drawStateScreen();
+}
+
+// ============================================================================
+//  ОШИБКИ
+// ============================================================================
+void errorText(NetError e, int code, const char* path, String& l1, String& l2) {
+  switch (e) {
+    case NET_WIFI_NO_SSID:  l1 = "WiFi not found";   l2 = WIFI_SSID;   break;
+    case NET_WIFI_BAD_PASS: l1 = "WiFi bad passwd";  l2 = WIFI_SSID;   break;
+    case NET_WIFI:          l1 = "No WiFi connect";  l2 = WIFI_SSID;   break;
+    case NET_DNS:           l1 = "DNS error";        l2 = SERVER_HOST; break;
+    case NET_CONNECT:       l1 = "Server offline";   l2 = SERVER_HOST; break;
+    case NET_SEND:          l1 = "Send failed";      l2 = "Check network"; break;
+    case NET_TIMEOUT:       l1 = "Server timeout";   l2 = "No response";   break;
+    case NET_HTTP:          l1 = "Server error";
+                            l2 = "HTTP " + String(code) + " " + (path ? path : ""); break;
+    case NET_BAD_RESPONSE:  l1 = "Bad response";     l2 = path ? path : ""; break;
+    default:                l1 = "Unknown error";    l2 = "";          break;
+  }
+}
+
+// Полноэкранное сообщение показывается, если ошибка новая или force=true
+// (например, после нажатия кнопки). Повторяющаяся фоновая ошибка видна
+// только меткой в первой строке экрана состояния — без мельтешения.
+void reportError(NetError e, int code = 0, const char* path = nullptr, bool force = false) {
+  bool isNew   = (e != lastError) || (code != lastHttpCode);
+  lastError    = e;
+  lastHttpCode = code;
+  String l1, l2;
+  errorText(e, code, path, l1, l2);
+  String extra = (e == NET_CONNECT) ? String(" port ") + String(SERVER_PORT) : String();
+  logLine("ERROR: " + l1 + " / " + l2 + extra);
+  if (isNew || force) showMessage(l1, l2);
+}
+
+void clearError() {
+  if (lastError != NET_NONE) logLine("Connection restored");
+  lastError    = NET_NONE;
+  lastHttpCode = 0;
+}
+
+// ============================================================================
+//  СВЕТОДИОДЫ / СОСТОЯНИЕ
+// ============================================================================
+void setLeds() {
+  if (!stateKnown && !pendingSend) {  // состояние неизвестно — оба выключены
+    digitalWrite(PIN_LED_OPEN, LOW);
+    digitalWrite(PIN_LED_CLOSE, LOW);
+    return;
+  }
+  digitalWrite(PIN_LED_OPEN,  opened ? HIGH : LOW);
+  digitalWrite(PIN_LED_CLOSE, opened ? LOW  : HIGH);
+}
+
+// Применить новое состояние. local=true — изменение сделано здесь
+// (кнопка / ночной режим) и его нужно отправить на сервер.
+void applyState(bool newState, bool local) {
+  opened = newState;
+  if (local) {
+    pendingSend  = true;
+    firstSendTry = true;
+    nextSendMs   = millis();  // отправить как можно скорее
+  } else {
+    stateKnown = true;
+  }
+  logLine(String("State: ") + (opened ? "OPEN" : "CLOSED") +
+          (local ? " (local, will send)" : " (from server)"));
+  setLeds();
+  messageActive = false;  // состояние важнее старого сообщения
+  drawStateScreen();
+}
+
+// ============================================================================
+//  КНОПКА
+// ============================================================================
+// Прерывание по любому фронту. Нажатие засчитывается, если пин стал LOW,
+// а до этого кнопка была стабильно отпущена не меньше BTN_STABLE_MS.
+// Это отсекает дребезг и при нажатии, и при отпускании.
+IRAM_ATTR void onButtonEdge() {
+  uint32_t now = millis();
+  bool isLow = digitalRead(PIN_BUTTON) == LOW;
+  if (isLow &&
+      (now - btnLastEdgeMs) >= BTN_STABLE_MS &&
+      (now - btnLastAcceptMs) >= BTN_MIN_INTERVAL_MS) {
+    buttonFlag      = true;
+    btnLastAcceptMs = now;
+  }
+  btnLastEdgeMs = now;
+}
+
+void handleButton() {
+  if (!buttonFlag) return;
+  buttonFlag = false;  // bool на ESP8266 пишется атомарно
+  logLine("Button pressed");
+  applyState(!opened, true);
+}
+
+// ============================================================================
+//  WiFi
+// ============================================================================
+NetError wifiError() {
+  int st = (int)WiFi.status();
+  if (st == WL_NO_SSID_AVAIL) return NET_WIFI_NO_SSID;
+  if (st == 6) return NET_WIFI_BAD_PASS;  // WL_WRONG_PASSWORD (ядро ESP8266 >= 3.0)
+  return NET_WIFI;
+}
+
+void wifiBegin() {
+  logLine(String("WiFi: connecting to ") + WIFI_SSID);
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  wifiBeginMs = millis();
+}
+
+void onWifiConnected() {
+  wifiWasConnected = true;
+  String ip = WiFi.localIP().toString();
+  logLine("WiFi connected, IP " + ip + ", RSSI " + String(WiFi.RSSI()) + " dBm");
+  if (lastError == NET_WIFI || lastError == NET_WIFI_NO_SSID || lastError == NET_WIFI_BAD_PASS) {
+    clearError();
+  }
+  showMessage(center("WiFi connected"), center(ip), 2000);
+  nextPollMs = millis();  // сразу синхронизироваться с сервером
+}
+
+// Неблокирующее обслуживание WiFi, вызывается в loop().
+void wifiMaintain() {
+  bool connected = WiFi.status() == WL_CONNECTED;
+
+  if (connected && !wifiWasConnected) {
+    onWifiConnected();
+  } else if (!connected && wifiWasConnected) {
+    wifiWasConnected = false;
+    wifiBeginMs = millis();  // даём автопереподключению время
+    reportError(wifiError());
+  } else if (!connected && millis() - wifiBeginMs > WIFI_RETRY_MS) {
+    NetError e = wifiError();
+    if (e != lastError) reportError(e);
+    wifiBegin();
+  }
+}
+
+// ============================================================================
+//  HTTP
+// ============================================================================
+HttpResult httpRequest(const char* method, const char* path, const String& body) {
+  HttpResult r;
+  r.err  = NET_NONE;
+  r.code = 0;
+  r.path = path;
+
+  if (WiFi.status() != WL_CONNECTED) { r.err = wifiError(); return r; }
+
+  // IP сервера: если задан IP — используем его, иначе DNS
+  IPAddress ip;
+  if (!ip.fromString(SERVER_HOST)) {
+    if (!WiFi.hostByName(SERVER_HOST, ip, DNS_TIMEOUT_MS)) { r.err = NET_DNS; return r; }
+  }
+
+  WiFiClient client;
+  client.setTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  if (!client.connect(ip, SERVER_PORT)) { r.err = NET_CONNECT; return r; }
+
+  String req;
+  req.reserve(256 + body.length());
+  req += method; req += ' '; req += path; req += " HTTP/1.1\r\n";
+  req += "Host: "; req += SERVER_HOST;
+  if (SERVER_PORT != 80) { req += ':'; req += String(SERVER_PORT); }
+  req += "\r\n";
+  req += "User-Agent: RoboticButton/" FW_VERSION "\r\n";
+  req += "Accept: application/json\r\n";
+  req += "Connection: close\r\n";
+  if (body.length()) {
+    req += "Content-Type: application/json\r\n";
+    req += "Content-Length: "; req += String(body.length()); req += "\r\n";
+  }
+  req += "\r\n";
+  req += body;
+
+  logLine(String(method) + " " + path + (body.length() ? " " + body : ""));
+
+  if (client.print(req) != req.length()) {
+    client.stop();
+    r.err = NET_SEND;
+    return r;
+  }
+
+  // Читаем ответ до закрытия соединения сервером или до таймаута
+  String raw;
+  raw.reserve(MAX_RESPONSE_LEN);
+  uint32_t start = millis();
+  while (millis() - start < HTTP_RESPONSE_TIMEOUT_MS) {
+    while (client.available()) {
+      char c = client.read();
+      if (raw.length() < MAX_RESPONSE_LEN) raw += c;
+    }
+    if (!client.connected() && !client.available()) break;
+    delay(5);  // отдаём время WiFi-стеку
+  }
+  client.stop();
+
+  int headerEnd = raw.indexOf("\r\n\r\n");
+  if (raw.length() == 0 || headerEnd < 0) {
+    r.err = raw.length() ? NET_BAD_RESPONSE : NET_TIMEOUT;
+    if (raw.length()) logLine("Raw response: " + raw);
+    return r;
+  }
+
+  // Статус: "HTTP/1.1 200 OK"
+  if (!raw.startsWith("HTTP/")) { r.err = NET_BAD_RESPONSE; return r; }
+  int sp = raw.indexOf(' ');
+  r.code = (sp > 0) ? raw.substring(sp + 1, sp + 4).toInt() : 0;
+  r.body = raw.substring(headerEnd + 4);
+  r.body.trim();
+
+  logLine("HTTP " + String(r.code) + " body: " + r.body);
+
+  if (r.code == 0)                     r.err = NET_BAD_RESPONSE;
+  else if (r.code < 200 || r.code > 299) r.err = NET_HTTP;
+  return r;
+}
+
+// Ищет "state": true/false. Возвращает 1, 0 или -1 (не найдено).
+int parseState(const String& body) {
+  int k = body.indexOf("\"state\"");
+  if (k < 0) return -1;
+  unsigned i = k + 7;
+  while (i < body.length() && (body[i] == ' ' || body[i] == '\t')) i++;
+  if (i >= body.length() || body[i] != ':') return -1;
+  i++;
+  while (i < body.length() && (body[i] == ' ' || body[i] == '\t')) i++;
+  if (body.startsWith("true", i))  return 1;
+  if (body.startsWith("false", i)) return 0;
+  return -1;
+}
+
+// ============================================================================
+//  СИНХРОНИЗАЦИЯ С СЕРВЕРОМ
+// ============================================================================
+// Получить состояние с сервера (фоново, без надписей на экране при успехе).
+void pollState() {
+  HttpResult r = httpRequest("GET", ENDPOINT_STATE, "");
+  if (r.err != NET_NONE) { reportError(r.err, r.code, r.path); return; }
+
+  int s = parseState(r.body);
+  if (s < 0) { reportError(NET_BAD_RESPONSE, r.code, r.path); return; }
+
+  clearError();
+  // Пока шёл запрос, могли нажать кнопку — локальное изменение важнее
+  if (buttonFlag || pendingSend) return;
+
+  if (!stateKnown || (s == 1) != opened) applyState(s == 1, false);
+}
+
+// Отправить локальное изменение на сервер.
+void sendState() {
+  bool sent = opened;
+  String body = sent ? "{\"state\": true}" : "{\"state\": false}";
+  HttpResult r = httpRequest("POST", ENDPOINT_CHANGE, body);
+
+  if (r.err == NET_NONE) {
+    if (opened == sent) pendingSend = false;  // за время запроса не нажимали снова
+    stateKnown = true;
+    clearError();
+    logLine("State delivered to server");
+    nextPollMs = millis() + POLL_INTERVAL_MS;
+    return;
+  }
+
+  reportError(r.err, r.code, r.path, firstSendTry);
+  firstSendTry = false;
+
+  if (r.err == NET_HTTP) {
+    // Сервер отказал явно — не повторяем, берём состояние с сервера
+    pendingSend = false;
+    nextPollMs  = millis();
+  } else {
+    // Сетевая ошибка — повторим позже, состояние на кнопке сохраняется
+    nextSendMs = millis() + SEND_RETRY_MS;
+  }
+}
+
+// ============================================================================
+//  НОЧНОЙ РЕЖИМ
+// ============================================================================
+void checkNight() {
+  if (!isDue(nextClockMs)) return;
+  nextClockMs = millis() + CLOCK_INTERVAL_MS;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    // update() возвращает false, если обновлять ещё рано, — это не ошибка
+    if (!timeSynced) timeSynced = timeClient.forceUpdate();
+    else             timeClient.update();
+  }
+  if (!timeSynced) { logLine("NTP: time not synced yet"); return; }
+
+  int hour = timeClient.getHours();
+  bool night = (hour >= NIGHT_START_HOUR) || (hour < NIGHT_END_HOUR);
+  logLine("Time " + timeClient.getFormattedTime() + (night ? " (night)" : ""));
+
+  if (night && opened) {
+    logLine("Night mode: auto close");
+    applyState(false, true);
+    showMessage(center("Night mode"), center("auto CLOSED"));
+  }
+}
+
+// ============================================================================
+//  SETUP / LOOP
+// ============================================================================
 void setup() {
-  Serial.begin(9600);  // Инициализация Serial порта для отладки
-
-  // Настройка пинов
-  pinMode(BUTTON, INPUT_PULLUP);  // Кнопка с внутренним подтягивающим резистором
-  pinMode(LED_OPEN, OUTPUT);      // Светодиод "ОТКРЫТО"
-  pinMode(LED_CLOSE, OUTPUT);     // Светодиод "ЗАКРЫТО"
-
-  // Настройка прерывания для кнопки (по спадающему фронту)
-  attachInterrupt(digitalPinToInterrupt(BUTTON), handleButtonInterrupt, FALLING);
-
-  // Инициализация LCD
-  LCD.init();
-  LCD.backlight();
-  printLCD(INIT_1, INIT_2);  // Вывод сообщения инициализации
-
-  // Настройка NTP клиента
-  timeClient.begin();
-  timeClient.setTimeOffset(+4 * 3600);  // Часовой пояс Москва (UTC+4)
-
-  delay(1000);
-  connectWiFi();      // Подключение к WiFi
-  updateState();      // Получение начального состояния с сервера
-  setButton(opened);  // Установка начального состояния светодиодов
-}
-
-// ==================== ОСНОВНОЙ ЦИКЛ ====================
-void loop() {
-  // Проверяем флаг от прерывания (кнопка была нажата)
-  if (stateChanged) {
-    stateChanged = false;
-
-    // Безопасное чтение volatile переменной
-    noInterrupts();
-    bool currentState = opened;
-    interrupts();
-
-    Serial.println(BUTTON_PRESSED);
-    sendState(currentState);  // Отправляем новое состояние на сервер
-    setButton(currentState);  // Обновляем светодиоды
-  }
-
-  checkState();  // Периодическая проверка состояния с сервера
-  checkClock();  // Периодическая проверка времени (ночной режим)
-}
-
-// ==================== ПОДКЛЮЧЕНИЕ К WiFi ====================
-void connectWiFi() {
-  if (WiFi.status() != WL_CONNECTED) {
-    printLCD(CONNECT_WIFI_1, CONNECT_WIFI_2);
-
-    WiFi.begin(WIFI_SSID, WIFI_PASS);  // Подключение к WiFi сети
-
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {  // Максимум 10 секунд (20 * 500ms)
-      delay(500);
-      attempts++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-      String ipStr = " " + WiFi.localIP().toString();  // Получаем IP адрес ESP8266
-      Serial.println(CONNECTED_WIFI_1 + ipStr);
-      printLCD(CONNECTED_WIFI_1, ipStr);
-      delay(5000);
-    } else {
-      printLCD(WIFI_FAIL_1, WIFI_FAIL_2);  // Ошибка подключения
-      delay(5000);
-    }
-  }
-}
-
-// ==================== ПОДКЛЮЧЕНИЕ К СЕРВЕРУ ====================
-bool connectServer() {
-  if (!client.connected()) {
-    printLCD(CONNECT_SERVER_1, CONNECT_SERVER_2);
-    delay(300);
-
-    // Разрешаем hostname в IP (динамическое получение IP Raspberry Pi)
-    IPAddress ip;
-    if (!WiFi.hostByName(host.c_str(), ip)) {
-      // Если не удалось разрешить hostname
-      printLCD(CONNECT_SERVER_FAIL_1, CONNECT_SERVER_FAIL_2);
-      delay(5000);
-      return false;
-    }
-
-    // Вывод разрешенного IP в Serial для отладки
-    Serial.print("Resolved " + host + " to: ");
-    Serial.println(ip);
-
-    // Подключение по полученному IP адресу
-    if (!client.connect(ip, port)) {
-      printLCD(CONNECT_SERVER_FAIL_1, CONNECT_SERVER_FAIL_2);
-      delay(5000);
-      return false;
-    }
-
-    printLCD(CONNECT_SERVER_SUCCESS_1, CONNECT_SERVER_SUCCESS_2);
-    delay(300);
-    return true;
-  }
-  return true;
-}
-
-// ==================== УПРАВЛЕНИЕ СВЕТОДИОДАМИ И LCD ====================
-void setButton(bool state) {
-  if (state) {
-    digitalWrite(LED_OPEN, HIGH);  // Включаем зеленый светодиод (ОТКРЫТО)
-    digitalWrite(LED_CLOSE, LOW);  // Выключаем красный светодиод
-    Serial.println(OPEN_STATE);
-    printLCD(OPENED_1, OPENED_2);  // Выводим "OPENED" на LCD
-  } else {
-    digitalWrite(LED_OPEN, LOW);    // Выключаем зеленый светодиод
-    digitalWrite(LED_CLOSE, HIGH);  // Включаем красный светодиод (ЗАКРЫТО)
-    Serial.println(CLOSE_STATE);
-    printLCD(CLOSED_1, CLOSED_2);  // Выводим "CLOSED" на LCD
-  }
-  lastOpened = state;  // Сохраняем состояние для отслеживания изменений
-}
-
-// ==================== ВЫВОД НА LCD ДИСПЛЕЙ ====================
-void printLCD(String line1, String line2) {
-  // Выводим в Serial для отладки
-  Serial.println(line1);
-  Serial.println(line2);
+  Serial.begin(SERIAL_BAUD);
   Serial.println();
+  logLine("Robotic Button v" FW_VERSION);
 
-  // Выводим на LCD
-  LCD.setCursor(0, 0);  // Первая строка
-  LCD.print(line1);
-  LCD.setCursor(0, 1);  // Вторая строка
-  LCD.print(line2);
-}
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_LED_OPEN, OUTPUT);
+  pinMode(PIN_LED_CLOSE, OUTPUT);
+  setLeds();  // пока состояние неизвестно — оба выключены
 
-// ==================== ПРОВЕРКА ВРЕМЕНИ (НОЧНОЙ РЕЖИМ) ====================
-void checkClock() {
-  static unsigned long lastClockCheck = 0;  // Время последней проверки
-  unsigned long curTime = millis();
+  lcd.init();
+  lcd.backlight();
+  lcdShow(center("Robotic Button"), center("firmware v" FW_VERSION));
+  delay(1500);
 
-  // Проверяем каждые CLOCK_DELAY миллисекунд
-  if ((curTime - lastClockCheck) > CLOCK_DELAY || curTime < lastClockCheck) {
-    lastClockCheck = curTime;
+  // WiFi: станция, без записи во flash, с автопереподключением
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  lcdShow(center("Connect to WiFi"), center(WIFI_SSID));
+  wifiBegin();
 
-    // Обновляем время с NTP сервера
-    if (!timeClient.update()) {
-      Serial.println(TIME_UPDATE_FAILED);
-      return;
-    }
-
-    int currentHour = timeClient.getHours();  // Получаем текущий час
-    Serial.print("Current hour: ");
-    Serial.println(currentHour);
-
-    // Безопасное чтение состояния
-    noInterrupts();
-    bool currentOpened = opened;
-    interrupts();
-
-    // Если ночное время (22:00 - 07:00) И состояние ОТКРЫТО
-    if ((CLOCK_START <= currentHour || currentHour < CLOCK_END) && currentOpened) {
-      Serial.println(LATE_NIGHT_CLOSING);
-      // Автоматически закрываем
-      noInterrupts();
-      opened = false;
-      interrupts();
-      sendState(false);  // Отправляем команду закрытия на сервер
-      setButton(false);  // Обновляем светодиоды
-    }
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_BOOT_TIMEOUT_MS) {
+    delay(100);
   }
-}
-
-// ==================== ПЕРИОДИЧЕСКАЯ ПРОВЕРКА СОСТОЯНИЯ ====================
-void checkState() {
-  static unsigned long lastStateCheck = 0;
-  unsigned long curTime = millis();
-
-  // Проверяем каждые STATE_DELAY миллисекунд
-  if ((curTime - lastStateCheck) > STATE_DELAY || curTime < lastStateCheck) {
-    lastStateCheck = curTime;
-    updateState();  // Обновляем состояние с сервера
-  }
-}
-
-// ==================== ОБНОВЛЕНИЕ СОСТОЯНИЯ С СЕРВЕРА ====================
-void updateState() {
-  if (!checkWiFiAndConnect()) return;  // Проверяем WiFi подключение
-  if (!connectServer()) return;        // Подключаемся к серверу
-
-  // Формируем GET запрос
-  String request = "GET " + endpointState + " HTTP/1.1\r\n";
-  request += "Host: " + host + "\r\n";  // Hostname (используется для HTTP/1.1)
-  request += "Connection: close\r\n";
-  request += "Accept: application/json\r\n\r\n";
-
-  Serial.println(SENDING_REQUEST);
-  Serial.println(request);
-
-  // Отправляем запрос
-  if (!sendHttpRequest(request)) {
-    client.stop();
-    return;
-  }
-
-  // Читаем ответ
-  String response = readHttpResponse();
-  client.stop();
-
-  // Парсим ответ и обновляем состояние при необходимости
-  if (response.length() > 0) {
-    bool newState = parseStateResponse(response);
-
-    noInterrupts();
-    if (newState != opened) {
-      opened = newState;
-      setButton(opened);
-    }
-    interrupts();
-  }
-}
-
-// ==================== ОТПРАВКА СОСТОЯНИЯ НА СЕРВЕР ====================
-void sendState(bool state) {
-  if (!checkWiFiAndConnect()) return;  // Проверяем WiFi
-  if (!connectServer()) return;        // Подключаемся к серверу
-
-  // Формируем JSON тело запроса
-  String postData = state ? "{\"state\": true}" : "{\"state\": false}";
-
-  // Формируем POST запрос
-  String request = "POST " + endpointChange + " HTTP/1.1\r\n";
-  request += "Host: " + host + "\r\n";
-  request += "Content-Type: application/json\r\n";
-  request += "Connection: close\r\n";
-  request += "Accept: application/json\r\n";
-  request += "Content-Length: " + String(postData.length()) + "\r\n\r\n";
-  request += postData;
-
-  Serial.println(SENDING_REQUEST);
-  Serial.println(request);
-
-  // Отправляем запрос
-  if (!sendHttpRequest(request)) {
-    client.stop();
-    return;
-  }
-
-  // Читаем ответ
-  String response = readHttpResponse();
-  client.stop();
-
-  if (response.length() > 0) {
-    Serial.println(RESPONSE_RECEIVED);
-    Serial.println(response);
-
-    // Проверяем статус ответа
-    if (response.indexOf("200 OK") == -1) {
-      Serial.println("Server returned error status");
-      printLCD(SERVER_ERROR_1, SERVER_ERROR_2);
-      delay(2000);
-    }
-  }
-}
-
-// ==================== ПРОВЕРКА WIFI ПОДКЛЮЧЕНИЯ ====================
-bool checkWiFiAndConnect() {
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi();  // Пытаемся переподключиться
-    if (WiFi.status() != WL_CONNECTED) {
-      return false;  // Не удалось подключиться
-    }
-  }
-  return true;  // WiFi подключен
-}
-
-// ==================== ОТПРАВКА HTTP ЗАПРОСА ====================
-bool sendHttpRequest(const String& request) {
-  client.setTimeout(HTTP_TIMEOUT);  // Устанавливаем таймаут
-
-  int bytesSent = client.println(request);  // Отправляем запрос
-  if (bytesSent == 0) {
-    Serial.println("Failed to send request");
-    printLCD(SEND_FAIL_1, SEND_FAIL_2);
-    delay(2000);
-    return false;
-  }
-
-  return true;
-}
-
-// ==================== ЧТЕНИЕ HTTP ОТВЕТА ====================
-String readHttpResponse() {
-  unsigned long timeout = millis() + HTTP_TIMEOUT;
-  String response = "";
-
-  // Читаем ответ пока не истек таймаут
-  while (millis() < timeout) {
-    if (client.available()) {
-      String line = client.readStringUntil('\n');
-      response += line + "\n";
-
-      // Если достигнут конец заголовков (пустая строка)
-      if (line == "\r") {
-        // Читаем тело ответа
-        while (client.available() && millis() < timeout) {
-          response += client.readString();
-        }
-        break;
-      }
-    }
-    delay(10);  // Небольшая задержка для предотвращения зависания
-  }
-
-  if (response.length() == 0) {
-    Serial.println("Response timeout");
-    printLCD(RESPONSE_TIMEOUT_1, RESPONSE_TIMEOUT_2);
-    delay(2000);
-  }
-
-  return response;
-}
-
-// ==================== ПАРСИНГ ОТВЕТА ОТ СЕРВЕРА ====================
-bool parseStateResponse(const String& response) {
-  // Ищем начало тела ответа (после двойного переноса строки)
-  int bodyStart = response.indexOf("\r\n\r\n");
-  if (bodyStart != -1) {
-    String body = response.substring(bodyStart + 4);  // Извлекаем тело
-    body.trim();
-
-    Serial.println("Response body:");
-    Serial.println(body);
-
-    // Проверяем JSON ответ
-    if (body.indexOf("{\"state\":true}") != -1) {
-      Serial.println(STATE_OPEN);
-      return true;
-    } else if (body.indexOf("{\"state\":false}") != -1) {
-      Serial.println(STATE_CLOSED);
-      return false;
-    } else {
-      Serial.println(NO_STATE_IN_RESPONSE);
-      printLCD(INVALID_RESPONSE_1, INVALID_RESPONSE_2);
-      delay(2000);
-    }
+  if (WiFi.status() == WL_CONNECTED) {
+    onWifiConnected();
   } else {
-    // Если не нашли тело ответа, проверяем статус ошибки
-    if (response.indexOf("200 OK") == -1) {
-      int statusStart = response.indexOf(' ');
-      if (statusStart != -1) {
-        String status = response.substring(statusStart + 1, response.indexOf('\n'));
-        Serial.println(HTTP_ERROR + status);
-        printLCD(HTTP_ERROR_1, status.substring(0, 15));
-        delay(2000);
-      }
-    }
+    reportError(wifiError());
   }
 
-  // Возвращаем текущее состояние, если не удалось распарсить
-  noInterrupts();
-  bool currentState = opened;
-  interrupts();
-  return currentState;
+  timeClient.begin();
+
+  btnLastEdgeMs = millis();
+  attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), onButtonEdge, CHANGE);
+
+  nextPollMs  = millis();  // сразу запросить состояние
+  nextClockMs = millis() + 5000;
+}
+
+void loop() {
+  handleButton();
+  wifiMaintain();
+
+  if (pendingSend) {
+    if (isDue(nextSendMs)) sendState();
+  } else if (isDue(nextPollMs)) {
+    pollState();
+    nextPollMs = millis() + (lastError == NET_NONE ? POLL_INTERVAL_MS : POLL_RETRY_MS);
+  }
+
+  handleButton();  // нажатие во время сетевого запроса обрабатываем сразу
+  checkNight();
+  updateDisplay();
+  delay(10);
 }
